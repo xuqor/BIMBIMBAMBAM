@@ -1,6 +1,7 @@
 // movement.cpp — CS:GO internal movement + ImGui (D3D9) menu, x86
 // offsets: frk1/hazedumper csgo.hpp 2023-09-05
-// run with -insecure, on VAC servers this is a ban
+// launch csgo with -insecure, on VAC servers this is a ban
+#define _CRT_SECURE_NO_WARNINGS
 #include <Windows.h>
 #include <d3d9.h>
 #include <cstdint>
@@ -14,12 +15,15 @@
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
+#define USE_MOUSE_XOR 1
+
 namespace off {
     constexpr uintptr_t m_fFlags      = 0x104;
     constexpr uintptr_t m_vecVelocity = 0x114;
     constexpr uintptr_t m_MoveType    = 0x25C;
     constexpr uintptr_t m_lifeState   = 0x25F;
     // client.dll
+    constexpr uintptr_t dwLocalPlayer    = 0xDEB99C;
     constexpr uintptr_t dwEntityList     = 0x4E0102C;
     constexpr uintptr_t dwForceJump      = 0x52BCD88;
     constexpr uintptr_t dwForceLeft      = 0x322EE50;
@@ -33,8 +37,8 @@ namespace off {
     // shaderapidx9.dll
     constexpr uintptr_t dwppDirect3DDevice9 = 0xA62C0;
 
-    constexpr int FL_ONGROUND   = 1 << 0;
-    constexpr int MOVETYPE_WALK = 2;
+    constexpr int FL_ONGROUND = 1 << 0;
+    constexpr int MOVETYPE_NOCLIP = 8, MOVETYPE_LADDER = 9, MOVETYPE_OBSERVER = 10;
     constexpr int VT_RESET = 16, VT_PRESENT = 17;
 }
 
@@ -46,6 +50,7 @@ struct Cfg {
 
 static uintptr_t g_client, g_engine;
 static volatile bool g_open = false, g_unload = false;
+static volatile long g_presentCalls = 0;
 static const char* g_status = "";
 
 // ---------- config json ----------
@@ -143,10 +148,14 @@ static void DrawMenu() {
 }
 
 // ---------- mouse unlock ----------
-// cl_mouseenable is stored xor'd with its own pointer. didn't verify on this build
+// cl_mouseenable is stored xor'd with its own pointer. not verified on this build
 static void SetMouse(bool enable) {
+#if USE_MOUSE_XOR
     uintptr_t ptr = g_client + off::dwMouseEnablePtr;
     *(int*)(g_client + off::dwMouseEnable) = (int)ptr ^ (enable ? 1 : 0);
+#else
+    (void)enable;
+#endif
 }
 
 // ---------- d3d9 hooks (vtable swap on the game's device) ----------
@@ -177,6 +186,7 @@ static LRESULT CALLBACK hkWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 static HRESULT WINAPI hkPresent(IDirect3DDevice9* dev, const RECT* a, const RECT* b, HWND c, const RGNDATA* d) {
+    InterlockedIncrement(&g_presentCalls);
     if (!g_init) {
         g_hwnd = FindWindowA("Valve001", nullptr);
         ImGui::CreateContext();
@@ -211,9 +221,13 @@ static HRESULT WINAPI hkReset(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pp) 
 template <class T> static T rd(uintptr_t a) { return *(T*)a; }
 
 static uintptr_t LocalPlayer(uintptr_t cs) {
-    int idx = rd<int>(cs + off::dwClientState_GetLocalPlayer);
-    if (idx < 0 || idx > 64) return 0;
-    return rd<uintptr_t>(g_client + off::dwEntityList + (uintptr_t)idx * 0x10);
+    // primary: direct pointer
+    uintptr_t lp = rd<uintptr_t>(g_client + off::dwLocalPlayer);
+    if (lp) return lp;
+    // fallback: clientstate slot -> entity index is slot+1
+    int slot = rd<int>(cs + off::dwClientState_GetLocalPlayer);
+    if (slot < 0 || slot > 63) return 0;
+    return rd<uintptr_t>(g_client + off::dwEntityList + (uintptr_t)(slot + 1) * 0x10);
 }
 
 // duck via scancode, default crouch = LCTRL. change wScan if rebound
@@ -235,10 +249,16 @@ static float NormYaw(float a) {
 }
 
 static DWORD WINAPI Main(LPVOID mod) {
+    AllocConsole();
+    FILE* cf; freopen_s(&cf, "CONOUT$", "w", stdout);
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    printf("[mv] loaded, waiting for modules\n");
+
     while (!(g_client = (uintptr_t)GetModuleHandleA("client.dll"))) Sleep(100);
     while (!(g_engine = (uintptr_t)GetModuleHandleA("engine.dll"))) Sleep(100);
     uintptr_t shader;
     while (!(shader = (uintptr_t)GetModuleHandleA("shaderapidx9.dll"))) Sleep(100);
+    printf("[mv] client=%p engine=%p shaderapi=%p\n", (void*)g_client, (void*)g_engine, (void*)shader);
 
     IDirect3DDevice9* dev = nullptr;
     while (!(dev = *(IDirect3DDevice9**)(shader + off::dwppDirect3DDevice9))) Sleep(100);
@@ -247,6 +267,7 @@ static DWORD WINAPI Main(LPVOID mod) {
     oReset   = (ResetFn)g_vt[off::VT_RESET];
     VtSet(off::VT_PRESENT, (void*)hkPresent);
     VtSet(off::VT_RESET, (void*)hkReset);
+    printf("[mv] device=%p, Present hooked | INSERT menu | END unload\n", (void*)dev);
 
     auto forceJump  = (int*)(g_client + off::dwForceJump);
     auto forceLeft  = (int*)(g_client + off::dwForceLeft);
@@ -254,6 +275,7 @@ static DWORD WINAPI Main(LPVOID mod) {
 
     float prevYaw = 0.f;
     bool surfTap = false;
+    DWORD lastLog = 0;
     LoadCfg();
 
     while (!g_unload) {
@@ -262,23 +284,42 @@ static DWORD WINAPI Main(LPVOID mod) {
             g_open = !g_open;
             g_binding = nullptr;
             SetMouse(!g_open);
-            if (!g_open) ImGui::GetIO().MouseDrawCursor = false;
+            if (!g_open && g_init) ImGui::GetIO().MouseDrawCursor = false;
+            printf("[mv] menu %s (present calls: %ld)\n", g_open ? "open" : "closed", g_presentCalls);
         }
 
         uintptr_t cs = rd<uintptr_t>(g_engine + off::dwClientState);
         uintptr_t lp = cs ? LocalPlayer(cs) : 0;
-        if (!lp || rd<uint8_t>(lp + off::m_lifeState) != 0 ||
-            rd<int>(lp + off::m_MoveType) != off::MOVETYPE_WALK || g_open) {
+
+        DWORD now = GetTickCount();
+        bool log = now - lastLog > 1000;
+        if (log) lastLog = now;
+
+        if (!lp) {
+            if (log) printf("[mv] no local player (cs=%p) — not in a match or offsets don't match build\n", (void*)cs);
+            Duck(false);
+            Sleep(10);
+            continue;
+        }
+
+        uint8_t life = rd<uint8_t>(lp + off::m_lifeState);
+        int mt       = rd<int>(lp + off::m_MoveType);
+        int flags    = rd<int>(lp + off::m_fFlags);
+        float vz     = rd<float>(lp + off::m_vecVelocity + 8);
+        float yaw    = rd<float>(cs + off::dwClientState_ViewAngles + 4);
+        bool ground  = flags & off::FL_ONGROUND;
+        bool space   = GetAsyncKeyState(VK_SPACE) & 0x8000;
+
+        if (log)
+            printf("[mv] lp=%p life=%u mt=%d flags=%d ground=%d vz=%.1f yaw=%.1f\n",
+                   (void*)lp, life, mt, flags, ground, vz, yaw);
+
+        if (life != 0 || g_open || mt == off::MOVETYPE_NOCLIP || mt == off::MOVETYPE_LADDER ||
+            mt == off::MOVETYPE_OBSERVER) {
             Duck(false);
             Sleep(g_open ? 10 : 5);
             continue;
         }
-
-        int   flags  = rd<int>(lp + off::m_fFlags);
-        bool  ground = flags & off::FL_ONGROUND;
-        float vz     = rd<float>(lp + off::m_vecVelocity + 8);
-        float yaw    = rd<float>(cs + off::dwClientState_ViewAngles + 4);
-        bool  space  = GetAsyncKeyState(VK_SPACE) & 0x8000;
 
         if (cfg.bhop && space && ground) *forceJump = 6;
 
@@ -308,26 +349,4 @@ static DWORD WINAPI Main(LPVOID mod) {
         Sleep(1);
     }
 
-    // teardown: unhook first, let in-flight frames drain, then free imgui
-    Duck(false);
-    *forceLeft = 4; *forceRight = 4;
-    VtSet(off::VT_PRESENT, (void*)oPresent);
-    VtSet(off::VT_RESET, (void*)oReset);
-    if (g_oldProc) SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)g_oldProc);
-    SetMouse(true);
-    Sleep(300);
-    if (g_init) {
-        ImGui_ImplDX9_Shutdown();
-        ImGui_ImplWin32_Shutdown();
-        ImGui::DestroyContext();
-    }
-    FreeLibraryAndExitThread((HMODULE)mod, 0);
-}
-
-BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID) {
-    if (reason == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(h);
-        CreateThread(nullptr, 0, Main, h, 0, nullptr);
-    }
-    return TRUE;
-}
+    // teardown: unhook,
