@@ -1,0 +1,33 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: fetch imgui
+        shell: cmd
+        run: git clone --depth 1 --branch v1.90.9 https://github.com/ocornut/imgui.git imgui
+
+      - name: build dll
+        shell: cmd
+        run: >
+          cl /nologo /LD /O2 /MT /EHsc /std:c++17 /I imgui
+          movement.cpp
+          imgui\imgui.cpp imgui\imgui_draw.cpp imgui\imgui_tables.cpp imgui\imgui_widgets.cpp
+          imgui\backends\imgui_impl_dx9.cpp imgui\backends\imgui_impl_win32.cpp
+          /Fe:movement.dll /link d3d9.lib user32.lib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: movement-dll
+          path: movement.dll
